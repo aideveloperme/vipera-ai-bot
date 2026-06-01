@@ -1,0 +1,21 @@
+{
+  "name": "vipera-ai-telegram-bot",
+  "version": "1.0.0",
+  "description": "VIPERA AI Telegram Bot — powered by FREE Google Gemini API",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.15.0",
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
