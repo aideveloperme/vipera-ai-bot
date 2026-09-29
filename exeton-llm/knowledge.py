@@ -38,11 +38,17 @@ def price_text(product):
 
 def product_card(product, max_desc=1500):
     """Compact, fact-first text block for one product."""
+    price, availability = price_text(product), product.get("availability") or "Unknown"
+    if product.get("price_unverified"):
+        # Listed only in hidden page data, not shown to shoppers — don't quote it as fact.
+        price = (f"Not confirmed — site data lists {price}, but the product page does not show it; "
+                 "ask sales for a quote")
+        availability = f"{product.get('visible_availability') or 'Unknown'} (confirm with sales)"
     lines = [
         f"PRODUCT: {product.get('name')}",
         f"SKU: {product.get('sku') or 'n/a'}",
-        f"PRICE: {price_text(product)}",
-        f"AVAILABILITY: {product.get('availability') or 'Unknown'}",
+        f"PRICE: {price}",
+        f"AVAILABILITY: {availability}",
     ]
     if product.get("categories"):
         lines.append(f"CATEGORIES: {', '.join(product['categories'])}")

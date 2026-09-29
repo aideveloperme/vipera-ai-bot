@@ -225,7 +225,7 @@ def parse_visible_product(url, soup):
     h1 = h1.get_text(" ", strip=True) if h1 else ""
     og = soup.find("meta", property="og:title")
     title = (og.get("content") if og else None) or (soup.title.get_text(strip=True) if soup.title else "")
-    title = title.split("|")[0].strip()
+    title = re.sub(r"^(buy|shop)\s+|\s+(online|for sale)$", "", title.split("|")[0].strip(), flags=re.I)
     # exeton.com often uses the bare model code as <h1> ("B343-C40"); prefer a longer page title.
     name = h1 or title or url
     if title and len(title) > len(h1) and h1.lower() in title.lower():
@@ -271,6 +271,22 @@ def parse_visible_product(url, soup):
         "description": text[:6000],
         "scraped_at": now_iso(),
     }
+
+
+def check_jsonld_price(product, soup, visible):
+    """Hidden JSON-LD prices can be template placeholders. Trust one only if the same
+    amount is actually shown on the page; otherwise mark it unverified."""
+    price = product.get("price")
+    if not price:
+        return product
+    amount = price["amount"]
+    shown = {float(m.group(1).replace(",", "") + "." + (m.group(2) or "00"))
+             for m in PRICE_RE.finditer(main_text(soup))}
+    if amount not in shown:
+        product["price_unverified"] = True
+        product["visible_price"] = visible.get("price")
+        product["visible_availability"] = visible.get("availability")
+    return product
 
 
 def breadcrumbs(soup):
@@ -369,8 +385,9 @@ def crawl_site(delay, max_pages, skip_products, render=False):
         ld = find_jsonld_product(soup)
         if ld or PRODUCT_URL_RE.search(urlparse(url).path):
             if not skip_products:
-                products.append(parse_product_page(url, soup, ld) if ld
-                                else parse_visible_product(url, soup))
+                visible = parse_visible_product(url, soup)
+                products.append(check_jsonld_price(parse_product_page(url, soup, ld), soup, visible)
+                                if ld else visible)
         else:
             title = soup.title.get_text(strip=True) if soup.title else url
             text = main_text(soup)
@@ -409,6 +426,12 @@ def main():
     if products is None:
         products = crawled_products
 
+    unverified = [p for p in products if p.get("price_unverified")]
+    if unverified:
+        print(f"\n⚠ {len(unverified)} products have a price in the site's hidden data (JSON-LD) that "
+              "is NOT shown on the page — the bot will tell customers to confirm with sales:")
+        for p in unverified[:15]:
+            print(f"   {p['price']['amount']:>12,.2f}  {p['name'][:60]}  {p['url']}")
     write_jsonl(DATA_DIR / "products.jsonl", products)
     write_jsonl(DATA_DIR / "pages.jsonl", pages)
 
