@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Nightly refresh: re-scrape exeton.com and rebuild the index, then restart the API.
-# crontab -e →  0 2 * * * /path/to/exeton-llm/refresh.sh >> /var/log/exeton-refresh.log 2>&1
+# Re-scrape exeton.com, rebuild the index, restart the chatbot so it loads the new data.
+# Scheduled by cron (see README "Keep it running"), e.g. every night at 02:00:
+#   0 2 * * * $HOME/vipera-ai-bot/exeton-llm/refresh.sh >> $HOME/exeton-refresh.log 2>&1
 set -euo pipefail
 cd "$(dirname "$0")"
-python scrape_exeton.py
-python build_index.py
-systemctl --user restart exeton-chat.service 2>/dev/null || echo "Restart chat_server.py to load the new index."
+PY=.venv/bin/python
+echo "=== refresh started $(date) ==="
+$PY scrape_exeton.py            # exits without touching data if the scrape looks broken
+$PY build_index.py
+systemctl --user restart exeton-chat.service
+echo "=== refresh done $(date) ==="

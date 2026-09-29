@@ -412,6 +412,8 @@ def main():
     ap.add_argument("--base-url", default=BASE_URL)
     ap.add_argument("--delay", type=float, default=0.5, help="seconds between requests")
     ap.add_argument("--max-pages", type=int, default=0, help="limit sitemap crawl (0 = all)")
+    ap.add_argument("--force", action="store_true",
+                    help="save results even if far fewer products were found than last time")
     ap.add_argument("--render", action="store_true",
                     help="render pages with a headless browser (for JavaScript-built sites)")
     args = ap.parse_args()
@@ -425,6 +427,13 @@ def main():
                                          skip_products=products is not None, render=args.render)
     if products is None:
         products = crawled_products
+
+    # Safety net for the nightly cron: if the site was down or changed, don't wipe good data.
+    previous = sum(1 for _ in (DATA_DIR / "products.jsonl").open()) \
+        if (DATA_DIR / "products.jsonl").exists() else 0
+    if previous and len(products) < previous * 0.5 and not args.force:
+        raise SystemExit(f"Only {len(products)} products found (last run: {previous}). Keeping the old "
+                         "data. Check the site, then re-run with --force to accept the new result.")
 
     unverified = [p for p in products if p.get("price_unverified")]
     if unverified:

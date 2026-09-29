@@ -1,0 +1,18 @@
+# Keeps the Exeton chatbot running (and starts it after a reboot).
+# Install: see README "Keep it running".
+[Unit]
+Description=Exeton Sales Engineer chatbot
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/vipera-ai-bot/exeton-llm
+Environment=LLM_BASE_URL=http://localhost:11434/v1
+Environment=LLM_MODEL=llama3.1:8b
+Environment=LIVE_REFRESH=0
+# Environment=ALLOWED_ORIGINS=https://exeton.com,https://www.exeton.com
+ExecStart=%h/vipera-ai-bot/exeton-llm/.venv/bin/uvicorn chat_server:app --host 0.0.0.0 --port 8010
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

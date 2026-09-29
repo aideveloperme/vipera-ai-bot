@@ -14,16 +14,22 @@ Env:
   LLM_API_KEY    if the endpoint needs one
   LIVE_REFRESH   1 = re-check price/stock on exeton.com for the retrieved products
   TOP_K          chunks to retrieve (default 6)
+  ALLOWED_ORIGINS  comma-separated websites allowed to call /chat from a browser
+
+Open http://<spark-ip>:<port>/ for a simple chat page.
 """
 
 import json
 import os
 import re
 import time
+from pathlib import Path
 
 import numpy as np
 import requests
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
@@ -43,6 +49,11 @@ meta = json.loads((INDEX_DIR / "meta.json").read_text())
 embedder = SentenceTransformer(meta["embed_model"])
 
 app = FastAPI(title="Exeton Sales Engineer")
+# Websites allowed to call /chat from the browser, e.g. "https://exeton.com,https://www.exeton.com"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if ALLOWED_ORIGINS:
+    app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+                       allow_methods=["POST", "GET"], allow_headers=["Content-Type"])
 
 
 # ── Retrieval ────────────────────────────────────────────────
@@ -136,6 +147,11 @@ def chat(req: ChatRequest):
         "sources": [{"name": h["name"], "url": h["url"], "score": round(h["score"], 3)}
                     for h in hits],
     }
+
+
+@app.get("/")
+def chat_page():
+    return FileResponse(Path(__file__).parent / "static" / "chat.html")
 
 
 @app.get("/health")

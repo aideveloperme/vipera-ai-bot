@@ -44,7 +44,9 @@ exeton.com ─────────► scrape ─► index      user ─► r
 | `chat_server.py` | 3 | FastAPI `/chat` endpoint: retrieval + live price/stock refresh + LLM call |
 | `make_sft_dataset.py` | 4 | (optional) Builds a fine-tuning dataset from the catalog |
 | `train_lora.py` | 5 | (optional) LoRA fine-tunes an open model on DGX Spark and merges it |
-| `refresh.sh` | – | Nightly re-scrape + re-index (cron) |
+| `refresh.sh` | – | Nightly re-scrape + re-index + restart (cron) |
+| `deploy/exeton-chat.service` | – | systemd service that keeps the chatbot running |
+| `static/chat.html` | – | Browser chat page served at `/` |
 | `knowledge.py` | – | Shared formatting + the sales-engineer system prompt |
 
 ---
@@ -143,12 +145,30 @@ vllm serve /work/outputs/exeton-merged --served-model-name exeton-sales
 - 70B-class bases need QLoRA (4-bit) and a much longer run. Try 8B first and compare answers.
 - Evaluate before switching: ask 50 real customer questions to the base model and to the tuned model (both with RAG), and check the prices, stock and links against the website.
 
-### Step 6: keep it fresh
+### Step 6: keep it running + keep it fresh
+Run the chatbot as a background service. It starts on boot and restarts if it crashes. It uses port **8010**, because 8000 is taken by the Vipera AI API container on this Spark.
+```bash
+cd ~/vipera-ai-bot/exeton-llm
+mkdir -p ~/.config/systemd/user
+cp deploy/exeton-chat.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now exeton-chat.service
+sudo loginctl enable-linger $USER          # keep it running when you log out / after reboot
+
+systemctl --user status exeton-chat.service   # should say "active (running)"
+journalctl --user -u exeton-chat.service -f   # live logs (Ctrl+C to exit)
+```
+Chat in the browser at **http://<spark-ip>:8010/**. Find the IP with `hostname -I`.
+
+Nightly re-scrape and re-index, which restarts the service with fresh prices and stock:
 ```bash
 crontab -e
-0 2 * * * /path/to/exeton-llm/refresh.sh >> /var/log/exeton-refresh.log 2>&1
+# add this line (runs 02:00 every night):
+0 2 * * * $HOME/vipera-ai-bot/exeton-llm/refresh.sh >> $HOME/exeton-refresh.log 2>&1
 ```
-Re-scraping and re-indexing is all that's needed when products or prices change. **No retraining.** Retrain the LoRA only when you want to change the bot's behaviour or style.
+If the site is down or returns far fewer products than last time, the scrape **keeps the old data** and the log explains why. When the drop is real, run `python scrape_exeton.py --force`. Re-scraping is all that's needed when products or prices change. **No retraining.**
+
+To change the model or port, edit `~/.config/systemd/user/exeton-chat.service`, then run `systemctl --user daemon-reload && systemctl --user restart exeton-chat.service`.
 
 ---
 
