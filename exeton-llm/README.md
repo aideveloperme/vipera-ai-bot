@@ -38,7 +38,8 @@ exeton.com ─────────► scrape ─► index      user ─► r
 
 | File | Step | Purpose |
 |---|---|---|
-| `scrape_exeton.py` | 1 | Scrapes the whole site: WooCommerce Store API → falls back to sitemap + schema.org JSON-LD. Writes `data/products.jsonl`, `data/pages.jsonl` |
+| `probe_stack.py` | 1 | Shows how the site is built (framework, server-rendered vs JavaScript, product APIs) |
+| `scrape_exeton.py` | 1 | Scrapes the whole site: `/all-products` + sitemap → every `/product-details/` page (JSON-LD or visible page). Writes `data/products.jsonl`, `data/pages.jsonl` |
 | `build_index.py` | 2 | Embeds products/pages on the GPU → `data/index/` |
 | `chat_server.py` | 3 | FastAPI `/chat` endpoint: retrieval + live price/stock refresh + LLM call |
 | `make_sft_dataset.py` | 4 | (optional) Builds a fine-tuning dataset from the catalog |
@@ -70,15 +71,25 @@ Pick the current `pytorch` tag from https://catalog.ngc.nvidia.com. NVIDIA also 
 
 ## 4. Step by step
 
-### Step 1: scrape exeton.com
+### Step 1: check how the site is built, then scrape exeton.com
+exeton.com is **not WooCommerce**. Products live at `/product-details/<slug>` and are listed on `/all-products`. First run the probe on the Spark (or any machine with internet):
+```bash
+python probe_stack.py https://exeton.com/product-details/h274-a81
+python probe_stack.py https://exeton.com/product-details/h274-a81 --browser   # + list the page's API/JSON calls
+```
+It reports the framework (Next.js, Laravel, …), whether price and stock are already in the raw HTML or only appear after JavaScript runs, any structured data (JSON-LD, `__NEXT_DATA__`), and, with `--browser`, the JSON API calls that return product data.
+
+Then scrape:
 ```bash
 python scrape_exeton.py                  # full site
 python scrape_exeton.py --max-pages 30   # quick test
+python scrape_exeton.py --render         # only if the probe says content is rendered by JavaScript
 ```
-- If exeton.com runs WooCommerce (URLs like `/product/...`, `/product-category/...`), the Store API returns every product with **price, stock status, SKU, categories and attributes** in a few requests.
-- Otherwise it walks the sitemap and reads each product page's schema.org `Product/Offer` data (price + availability). Every other page (about, warranty, shipping, financing, contact, blog) is saved as text, so the bot can answer company and policy questions too.
+- Product URLs come from `/all-products` (with pagination) plus the sitemap, if there is one. Menu and footer links (about, contact, warranty…) are saved as company pages.
+- Each product page is read from schema.org JSON-LD if present. Otherwise it's read from the visible page: `<h1>` title, first price after the title (`$`, `USD`, `AED`, `€`, `£`), stock wording ("In stock", "Out of stock", "Lead time", "Request a quote"…), spec tables, breadcrumbs. The full page text is kept, so the LLM still sees every detail.
+- WooCommerce's Store API is tried first and simply skipped on exeton.com. The live price/stock re-check in `chat_server.py` only works with that API, so here answers use the last scrape: **run the nightly refresh** (step 6), or every few hours.
 - It respects `robots.txt` and waits between requests (`--delay`).
-- Check the output: `head -n 3 data/products.jsonl`. Make sure prices and availability look right. If a field is missing, adjust `parse_product_page()` to match the site's HTML.
+- Check the output: `head -n 3 data/products.jsonl`. Compare a few products with the website. If a field is wrong, adjust `parse_visible_product()`, or send the probe output so it can be matched to the site's exact HTML or API.
 
 ### Step 2: build the search index
 ```bash

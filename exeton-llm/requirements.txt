@@ -5,6 +5,8 @@ numpy>=1.26
 sentence-transformers>=3.0
 fastapi>=0.110
 uvicorn>=0.29
+# optional: probe --browser / scrape --render  (then: playwright install chromium)
+# playwright>=1.45
 
 # Fine-tuning (DGX Spark, inside the NGC PyTorch container — torch comes with it)
 transformers>=4.56

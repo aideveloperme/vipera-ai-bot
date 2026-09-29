@@ -4,9 +4,12 @@ Step 1 — Scrape exeton.com into clean JSONL files.
 Strategy (tried in order):
   1. WooCommerce Store API (/wp-json/wc/store/v1/products) — structured
      name, SKU, price, stock status, categories, attributes. Fastest + most accurate.
-  2. Sitemap crawl — every product page is parsed for schema.org JSON-LD
-     (Product / Offer), which gives price + availability even on non-Woo sites.
-  3. All other sitemap pages (about, warranty, shipping, contact, blog...) are
+  2. Site crawl — URLs from the sitemap + links found on /all-products
+     (exeton.com product pages live at /product-details/<slug>). Each product
+     page is parsed from schema.org JSON-LD when present, otherwise from the
+     visible page (h1, price text, stock wording, spec tables).
+     Use --render if the site builds pages with JavaScript (needs Playwright).
+  3. All other pages (about, warranty, shipping, contact, blog...) are
      saved as plain text so the bot can answer company/policy questions too.
 
 Outputs:
@@ -16,6 +19,7 @@ Outputs:
 Usage:
   python scrape_exeton.py                 # full scrape
   python scrape_exeton.py --max-pages 50  # quick test
+  python scrape_exeton.py --render        # JS-rendered site (pip install playwright)
 """
 
 import argparse
@@ -34,6 +38,14 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://exeton.com"
 USER_AGENT = "ExetonSalesBot/1.0 (+internal knowledge-base crawler)"
 DATA_DIR = Path(__file__).parent / "data"
+LISTING_PATHS = ["/all-products"]                        # pages that link to every product
+PRODUCT_URL_RE = re.compile(r"/(product-details|product)/[^/?#]+/?$")
+PRICE_RE = re.compile(r"(?:US\$|\$|USD\s?|AED\s?|€|£)\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))?")
+STOCK_PHRASES = [  # checked in order; first match wins
+    "out of stock", "sold out", "pre-order", "preorder", "backorder", "limited stock",
+    "limited availability", "in stock", "available now", "ships in", "lead time",
+    "call for price", "request a quote", "get a quote", "contact sales", "inquire",
+]
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
@@ -55,6 +67,26 @@ def get(url, delay, **kwargs):
     resp = session.get(url, timeout=30, **kwargs)
     resp.raise_for_status()
     return resp
+
+
+_browser = None
+
+
+def get_html(url, delay, render=False):
+    """Page HTML — raw, or after JavaScript has run (Playwright) when render=True."""
+    if not render:
+        return get(url, delay).text
+    global _browser
+    if _browser is None:
+        from playwright.sync_api import sync_playwright
+        _browser = sync_playwright().start().chromium.launch()
+    time.sleep(delay)
+    page = _browser.new_page(user_agent=USER_AGENT)
+    try:
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        return page.content()
+    finally:
+        page.close()
 
 
 # ── 1. WooCommerce Store API ─────────────────────────────────
@@ -182,6 +214,50 @@ def parse_product_page(url, soup, ld):
     }
 
 
+def parse_visible_product(url, soup):
+    """Fallback when a product page has no JSON-LD: read what a customer sees."""
+    h1 = soup.find("h1")
+    og = soup.find("meta", property="og:title")
+    name = (h1.get_text(" ", strip=True) if h1 else None) or (og and og.get("content")) \
+        or (soup.title.get_text(strip=True).split("|")[0].strip() if soup.title else url)
+    specs = extract_spec_table(soup)
+    text = main_text(soup)
+
+    # Look for the price after the product title, so related-product prices lower down lose.
+    start = max(text.find(name[:40]), 0) if name else 0
+    price = None
+    m = PRICE_RE.search(text, start) or PRICE_RE.search(text)
+    if m:
+        amount = float(m.group(1).replace(",", "") + "." + (m.group(2) or "00"))
+        cur = m.group(0).strip()
+        currency = "AED" if cur.startswith("AED") else "EUR" if cur.startswith("€") \
+            else "GBP" if cur.startswith("£") else "USD"
+        if amount > 0:
+            price = {"amount": amount, "currency": currency}
+
+    lowered = text.lower()
+    availability = next((p for p in STOCK_PHRASES if p in lowered), None)
+    sku = next((v for k, v in specs.items() if k.strip().lower() in ("sku", "part number", "model", "mpn")),
+               None)
+    return {
+        "id": None,
+        "source": "html",
+        "name": name,
+        "sku": sku,
+        "url": url,
+        "price": price,
+        "on_backorder": availability in ("backorder", "pre-order", "preorder"),
+        "in_stock": availability in ("in stock", "available now", "limited stock",
+                                     "limited availability") if availability else None,
+        "availability": availability.capitalize() if availability else "Unknown — confirm with sales",
+        "categories": [a.get_text(strip=True) for a in soup.select("nav[aria-label*=readcrumb] a, .breadcrumb a")][1:],
+        "attributes": specs,
+        "short_description": "",
+        "description": text[:6000],
+        "scraped_at": now_iso(),
+    }
+
+
 def extract_spec_table(soup):
     specs = {}
     for row in soup.select("table tr"):
@@ -194,6 +270,7 @@ def extract_spec_table(soup):
 
 
 def main_text(soup):
+    soup = BeautifulSoup(str(soup), "html.parser")  # don't mutate the caller's tree
     for sel in ["script", "style", "nav", "header", "footer", "noscript", "form"]:
         for t in soup.select(sel):
             t.decompose()
@@ -201,7 +278,36 @@ def main_text(soup):
     return re.sub(r"\s+", " ", main.get_text(" ", strip=True))
 
 
-def crawl_sitemap(delay, max_pages, skip_products):
+def listing_product_urls(delay, render, max_listing_pages=50):
+    """Collect product links from listing pages (follows ?page=N style pagination).
+
+    Also returns the site's other internal links (menu/footer: about, contact,
+    warranty...) so company pages are covered even without a sitemap."""
+    site = urlparse(BASE_URL).netloc.removeprefix("www.")
+    found, other, seen, queue = [], [], set(), [BASE_URL + p for p in LISTING_PATHS]
+    while queue and len(seen) < max_listing_pages:
+        url = queue.pop(0)
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            soup = BeautifulSoup(get_html(url, delay, render), "html.parser")
+        except Exception as e:  # noqa: BLE001 — a missing listing page is not fatal
+            print(f"  listing {url}: {e}")
+            continue
+        for a in soup.find_all("a", href=True):
+            link = urljoin(url, a["href"]).split("#")[0]
+            if PRODUCT_URL_RE.search(urlparse(link).path):
+                found.append(link)
+            elif re.search(r"[?&]page=\d+|/page/\d+", link) and \
+                    urlparse(link).path == urlparse(url).path:
+                queue.append(link)
+            elif urlparse(link).netloc.removeprefix("www.") == site and "?" not in link:
+                other.append(link.rstrip("/") or BASE_URL)
+    return list(dict.fromkeys(found)), list(dict.fromkeys(other))
+
+
+def crawl_site(delay, max_pages, skip_products, render=False):
     robots = urllib.robotparser.RobotFileParser(f"{BASE_URL}/robots.txt")
     try:
         robots.read()
@@ -211,6 +317,9 @@ def crawl_sitemap(delay, max_pages, skip_products):
     site = urlparse(BASE_URL).netloc.removeprefix("www.")
     urls = sitemap_urls(delay)
     print(f"  Sitemap: {len(urls)} URLs")
+    listed, other = listing_product_urls(delay, render)
+    print(f"  Listing pages: {len(listed)} product URLs, {len(other)} other site links")
+    urls = list(dict.fromkeys(listed + urls + other))
     products, pages = [], []
     for i, url in enumerate(urls[:max_pages] if max_pages else urls):
         if urlparse(url).netloc.removeprefix("www.") != site:
@@ -218,14 +327,15 @@ def crawl_sitemap(delay, max_pages, skip_products):
         if robots and not robots.can_fetch(USER_AGENT, url):
             continue
         try:
-            soup = BeautifulSoup(get(url, delay).text, "html.parser")
-        except requests.RequestException as e:
+            soup = BeautifulSoup(get_html(url, delay, render), "html.parser")
+        except Exception as e:  # noqa: BLE001 — skip any page that fails to load
             print(f"  skip {url}: {e}")
             continue
         ld = find_jsonld_product(soup)
-        if ld:
+        if ld or PRODUCT_URL_RE.search(urlparse(url).path):
             if not skip_products:
-                products.append(parse_product_page(url, soup, ld))
+                products.append(parse_product_page(url, soup, ld) if ld
+                                else parse_visible_product(url, soup))
         else:
             title = soup.title.get_text(strip=True) if soup.title else url
             text = main_text(soup)
@@ -250,15 +360,17 @@ def main():
     ap.add_argument("--base-url", default=BASE_URL)
     ap.add_argument("--delay", type=float, default=0.5, help="seconds between requests")
     ap.add_argument("--max-pages", type=int, default=0, help="limit sitemap crawl (0 = all)")
+    ap.add_argument("--render", action="store_true",
+                    help="render pages with a headless browser (for JavaScript-built sites)")
     args = ap.parse_args()
     BASE_URL = args.base_url.rstrip("/")
 
     print("[1/2] WooCommerce Store API")
     products = scrape_store_api(args.delay)
 
-    print("[2/2] Sitemap crawl")
-    crawled_products, pages = crawl_sitemap(args.delay, args.max_pages,
-                                            skip_products=products is not None)
+    print("[2/2] Site crawl (sitemap + listing pages)")
+    crawled_products, pages = crawl_site(args.delay, args.max_pages,
+                                         skip_products=products is not None, render=args.render)
     if products is None:
         products = crawled_products
 
