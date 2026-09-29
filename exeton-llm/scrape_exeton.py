@@ -44,8 +44,13 @@ PRICE_RE = re.compile(r"(?:US\$|\$|USD\s?|AED\s?|€|£)\s?(\d{1,3}(?:,\d{3})+|\
 STOCK_PHRASES = [  # checked in order; first match wins
     "out of stock", "sold out", "pre-order", "preorder", "backorder", "limited stock",
     "limited availability", "in stock", "available now", "ships in", "lead time",
-    "call for price", "request a quote", "get a quote", "contact sales", "inquire",
+    "contact for pricing", "call for price", "request a quote", "get a quote", "contact sales",
+    "inquire",
 ]
+IN_STOCK = ("in stock", "available now", "limited stock", "limited availability")
+QUOTE_ONLY = ("contact for pricing", "call for price", "request a quote", "get a quote",
+              "contact sales", "inquire")
+MPN_RE = re.compile(r"\b(?:MPN|SKU|Part\s*(?:No\.?|Number))\s*[:#]\s*([A-Z0-9][\w\-./+]{2,})", re.I)
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
@@ -205,7 +210,7 @@ def parse_product_page(url, soup, ld):
         "on_backorder": "BackOrder" in availability.replace(" ", ""),
         "in_stock": availability.replace(" ", "") in ("InStock", "LimitedAvailability"),
         "availability": availability,
-        "categories": [c.get_text(strip=True) for c in soup.select(".posted_in a")],
+        "categories": [c.get_text(strip=True) for c in soup.select(".posted_in a")] or breadcrumbs(soup),
         "attributes": extract_spec_table(soup),
         "short_description": clean_html(str(soup.select_one(
             ".woocommerce-product-details__short-description") or "")),
@@ -217,9 +222,14 @@ def parse_product_page(url, soup, ld):
 def parse_visible_product(url, soup):
     """Fallback when a product page has no JSON-LD: read what a customer sees."""
     h1 = soup.find("h1")
+    h1 = h1.get_text(" ", strip=True) if h1 else ""
     og = soup.find("meta", property="og:title")
-    name = (h1.get_text(" ", strip=True) if h1 else None) or (og and og.get("content")) \
-        or (soup.title.get_text(strip=True).split("|")[0].strip() if soup.title else url)
+    title = (og.get("content") if og else None) or (soup.title.get_text(strip=True) if soup.title else "")
+    title = title.split("|")[0].strip()
+    # exeton.com often uses the bare model code as <h1> ("B343-C40"); prefer a longer page title.
+    name = h1 or title or url
+    if title and len(title) > len(h1) and h1.lower() in title.lower():
+        name = title
     specs = extract_spec_table(soup)
     text = main_text(soup)
 
@@ -237,8 +247,11 @@ def parse_visible_product(url, soup):
 
     lowered = text.lower()
     availability = next((p for p in STOCK_PHRASES if p in lowered), None)
-    sku = next((v for k, v in specs.items() if k.strip().lower() in ("sku", "part number", "model", "mpn")),
-               None)
+    if availability in QUOTE_ONLY:
+        price = None  # a "$" figure on a quote-only page is not this product's price
+    mpn = MPN_RE.search(text)
+    sku = (mpn and mpn.group(1)) or next(
+        (v for k, v in specs.items() if k.strip().lower() in ("sku", "part number", "model", "mpn")), None)
     return {
         "id": None,
         "source": "html",
@@ -247,10 +260,12 @@ def parse_visible_product(url, soup):
         "url": url,
         "price": price,
         "on_backorder": availability in ("backorder", "pre-order", "preorder"),
-        "in_stock": availability in ("in stock", "available now", "limited stock",
-                                     "limited availability") if availability else None,
-        "availability": availability.capitalize() if availability else "Unknown — confirm with sales",
-        "categories": [a.get_text(strip=True) for a in soup.select("nav[aria-label*=readcrumb] a, .breadcrumb a")][1:],
+        "in_stock": None if availability in QUOTE_ONLY or not availability
+        else availability in IN_STOCK,
+        "availability": "Contact sales for pricing and availability (request a quote)"
+        if availability in QUOTE_ONLY
+        else availability.capitalize() if availability else "Unknown — confirm with sales",
+        "categories": breadcrumbs(soup),
         "attributes": specs,
         "short_description": "",
         "description": text[:6000],
@@ -258,10 +273,29 @@ def parse_visible_product(url, soup):
     }
 
 
+def breadcrumbs(soup):
+    """Category path from BreadcrumbList JSON-LD or a breadcrumb nav (minus Home and the product)."""
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except json.JSONDecodeError:
+            continue
+        for node in (data if isinstance(data, list) else data.get("@graph", [data])):
+            if node.get("@type") == "BreadcrumbList":
+                names = [(i.get("name") or (i.get("item") or {}).get("name") or "")
+                         for i in node.get("itemListElement", [])]
+                return [n for n in names[1:-1] if n]
+    links = [a.get_text(strip=True) for a in soup.select(
+        "nav[aria-label*=readcrumb] a, .breadcrumb a, [class*=breadcrumb] a")]
+    return [n for n in links[1:] if n]
+
+
 def extract_spec_table(soup):
     specs = {}
     for row in soup.select("table tr"):
         cells = row.find_all(["th", "td"])
+        if all(c.name == "th" for c in cells):  # header row ("Specification | Value")
+            continue
         if len(cells) == 2:
             k, v = cells[0].get_text(" ", strip=True), cells[1].get_text(" ", strip=True)
             if k and v and len(k) < 80:
@@ -275,7 +309,8 @@ def main_text(soup):
         for t in soup.select(sel):
             t.decompose()
     main = soup.select_one("main") or soup.select_one("article") or soup.body or soup
-    return re.sub(r"\s+", " ", main.get_text(" ", strip=True))
+    text = re.sub(r"[↑↓←→‹›]", " ", main.get_text(" ", strip=True))  # UI arrows
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def listing_product_urls(delay, render, max_listing_pages=50):
