@@ -1,0 +1,14 @@
+# Scraping + RAG server (any machine)
+requests>=2.31
+beautifulsoup4>=4.12
+numpy>=1.26
+sentence-transformers>=3.0
+fastapi>=0.110
+uvicorn>=0.29
+
+# Fine-tuning (DGX Spark, inside the NGC PyTorch container — torch comes with it)
+transformers>=4.56
+datasets>=2.20
+peft>=0.12
+trl>=0.20
+accelerate>=0.33
